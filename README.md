@@ -88,16 +88,80 @@ APFS Daemon (passthrough + shadow logic)
 Underlying Filesystem (ext4, etc.)
 ```
 
+## Usage
+
+```bash
+# Setup
+mkdir -p /tmp/apfs-backing /tmp/apfs-mount /tmp/apfs-shadows
+
+# Mount with watched files and policies
+python3 apfs.py /tmp/apfs-backing /tmp/apfs-mount \
+  --shadow-dir /tmp/apfs-shadows \
+  --watch notebook.md notes.md \
+  --policy notebook.md=append_only notes.md=annotate_only
+
+# Agents operate on files through the mount point
+echo "New entry" >> /tmp/apfs-mount/notebook.md   # OK — append
+cat > /tmp/apfs-mount/notebook.md                 # VIOLATION — overwrite
+
+# Check results
+cat /tmp/apfs-shadows/notebook.md.shadow.md       # Full behavioral record
+cat /tmp/apfs-shadows/journal.log                 # Operation log
+cat /tmp/apfs-shadows/violations.log              # Policy violations only
+```
+
+### Agent Identification
+
+APFS identifies which agent made each file operation via process introspection:
+
+1. `APFS_AGENT_ID` env var (explicit — set by wrapper scripts)
+2. `CLAUDE_PROJECT_DIR` env var (automatic — Claude Code sets this)
+3. tmux session name mapping (`--session-map sixel-comms-email=comms`)
+
+```bash
+# With explicit agent IDs
+APFS_AGENT_ID=comms echo "entry" >> /tmp/apfs-mount/notebook.md
+
+# With tmux session mapping
+python3 apfs.py ... --session-map sixel-comms-email=comms sixel-bio-email=bio
+```
+
+### Policies
+
+| Policy | Appends | Modifications | Deletions | Use for |
+|--------|---------|---------------|-----------|---------|
+| `append_only` | OK | VIOLATION | VIOLATION | Lab notebooks, records |
+| `annotate_only` | OK | OK | VIOLATION | Notes, living documents |
+| `unrestricted` | OK | OK | OK | Config files, scratch |
+
+Violations are logged but **never blocked**. The agent operates normally. The shadow captures the evidence.
+
 ## Requirements
 
 - Linux with FUSE support (kernel module `fuse.ko`)
-- `fuse3` userspace tools
+- `fuse3` userspace tools + `fusepy` Python package
 - For Docker: `--device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined`
-- Python 3.10+ (prototype) or Go 1.21+ (production)
+
+## Testing
+
+```bash
+# Unit tests (no FUSE needed)
+python3 test_shadow.py
+
+# FUSE integration tests (requires FUSE)
+# See lab-notebook.md for test scenarios
+```
 
 ## Status
 
-Concept and architecture stage. See [Lab Notebook](lab-notebook.md) for the development record.
+Python prototype tested. All core features verified in QEMU/KVM VM:
+- Passthrough filesystem (transparent to agents)
+- Shadow engine (append-only behavioral record)
+- Agent identification (process introspection)
+- Policy enforcement (violations logged, not blocked)
+- Concurrent write handling (FUSE serialization, no race conditions)
+
+See [Lab Notebook](lab-notebook.md) for the complete development record.
 
 ## Origin
 
