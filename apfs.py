@@ -440,7 +440,69 @@ class APFS(Operations):
         return os.symlink(target, self._full_path(name))
 
     def rename(self, old, new):
-        return os.rename(self._full_path(old), self._full_path(new))
+        old_rel = self._rel_path(old)
+        new_rel = self._rel_path(new)
+        agent = self.agent_id.identify()
+
+        # Capture rename involving watched files
+        old_watched = self.shadow.is_watched(old_rel)
+        new_watched = self.shadow.is_watched(new_rel)
+
+        if old_watched or new_watched:
+            timestamp = __import__('datetime').datetime.now(
+                __import__('datetime').timezone.utc
+            ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            # If renaming a watched file away — record it left
+            if old_watched:
+                shadow_file = self.shadow.shadow_path(old_rel)
+                shadow_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(shadow_file, 'a') as f:
+                    f.write(f"\n<!-- APFS: renamed to {new_rel} by {agent} at {timestamp} -->\n")
+
+            # If renaming something OVER a watched name — record what was replaced
+            if new_watched:
+                full_new = self._full_path(new)
+                if os.path.exists(full_new):
+                    try:
+                        with open(full_new, 'r') as f:
+                            old_content = f.read()
+                        self.shadow.process_write(new_rel, "", agent_id=f"{agent}-rename-over")
+                    except Exception:
+                        pass
+
+            # Journal the rename
+            journal_file = self.shadow.shadow_dir / "journal.log"
+            with open(journal_file, 'a') as f:
+                f.write(f"[{timestamp}] rename {old_rel} -> {new_rel} by {agent}\n")
+
+        result = os.rename(self._full_path(old), self._full_path(new))
+
+        # If something was renamed TO a watched name, snapshot and record the new content
+        if new_watched:
+            full_new = self._full_path(new)
+            try:
+                with open(full_new, 'r') as f:
+                    content = f.read()
+                self.shadow.snapshot(new_rel, content)
+
+                # Record arrival in shadow with the actual content
+                shadow_file = self.shadow.shadow_path(new_rel)
+                shadow_file.parent.mkdir(parents=True, exist_ok=True)
+                timestamp = __import__('datetime').datetime.now(
+                    __import__('datetime').timezone.utc
+                ).strftime("%Y-%m-%d %H:%M:%S UTC")
+                with open(shadow_file, 'a') as f:
+                    f.write(f"\n<!-- APFS: renamed from {old_rel} by {agent} at {timestamp} -->\n")
+                    # Include the content that arrived so the shadow has the complete record
+                    for line in content.splitlines(keepends=True):
+                        f.write(line)
+                    if content and not content.endswith('\n'):
+                        f.write('\n')
+            except Exception:
+                pass
+
+        return result
 
     def link(self, target, name):
         return os.link(self._full_path(name), self._full_path(target))
