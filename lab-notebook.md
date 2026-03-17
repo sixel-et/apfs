@@ -92,10 +92,27 @@ Initial content: two notebook entries (Entry 1: "sky is blue", Entry 2: "water i
 
 5. **Shadow append-only property.** The shadow file is only ever appended to, never truncated. Even if the actual file is destroyed, the shadow preserves the complete behavioral record. This is the key invariant.
 
+### Test 5 — Concurrent writes (the actual problem)
+
+Two simulated agents writing to the same file simultaneously:
+- Agent B: `cat >>` (append — simulates Edit tool)
+- Agent A: `cat >` (full file replacement — simulates Write tool), with slight delay
+
+**Result:** Agent B's append landed first. Agent A's write replaced the entire file, including Agent B's new content. The actual file lost Agent B's entry.
+
+**Shadow captured everything:**
+1. Agent B's append recorded: `<!-- APFS: append -->` + reviewer entry
+2. Agent A's overwrite detected as modification: reviewer entry struck through (`~~xAI presentation draft~~`), replaced with bio entry
+3. Journal shows both events: `append +4/-0` then `modification +2/-2`
+
+**This is the exact scenario that caused the original notebook overwrite.** The actual file loses data. The shadow preserves the complete record — what was written, what was overwritten, in what order. Reading the shadow tells you both that data loss occurred and what was lost.
+
+**Key observation:** FUSE serializes the writes. Agent B's append was committed and the shadow snapshot updated before Agent A's write arrived. So the diff correctly shows Agent A's write as a modification of the post-append state. No race condition — FUSE's synchronous interception means every write is observed in sequence, even when the writers are concurrent.
+
 ### What's next
 
 1. **Agent identification** — Correlate file operations to specific agents (process tree, tmux session, or file-based agent ID protocol)
 2. **Container integration** — Add FUSE flags to Docker config, test with actual agent sessions
-3. **Concurrent write test** — Two processes writing to the same file through the mount
+3. ~~**Concurrent write test**~~ — DONE. FUSE serialization works. Shadow captures data loss correctly.
 4. **Policy enforcement** — Detect violations (e.g., notebook was overwritten with Write tool) and flag them without blocking
 5. **Performance measurement** — Baseline passthrough overhead, shadow diff cost per write
