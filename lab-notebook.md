@@ -109,9 +109,28 @@ Two simulated agents writing to the same file simultaneously:
 
 **Key observation:** FUSE serializes the writes. Agent B's append was committed and the shadow snapshot updated before Agent A's write arrived. So the diff correctly shows Agent A's write as a modification of the post-append state. No race condition — FUSE's synchronous interception means every write is observed in sequence, even when the writers are concurrent.
 
+### Test 6 — Agent identification
+
+Added `AgentIdentifier` class that uses `fuse_get_context()` to get the calling process's PID, then checks its environment for identity signals. Resolution order:
+
+1. `APFS_AGENT_ID` env var (explicit, highest priority)
+2. `CLAUDE_PROJECT_DIR` env var (Claude Code sets this — maps to perspective)
+3. tmux session name (via `tmux display-message` + session map)
+4. "unknown" fallback
+
+Test: comms appended Entry 2, bio overwrote the file (losing comms' content). Journal correctly shows:
+```
+append on notebook.md by comms: +4/-0 lines
+modification on notebook.md by bio: +3/-7 lines
+```
+
+Shadow shows comms' content struck through with `[modified ... by bio]` attribution. The shadow now answers: who overwrote whose content and when.
+
+**Note on resolution:** In our container, all three perspectives run as user `sixel` but in different tmux sessions with different `CLAUDE_PROJECT_DIR` values. The env var approach works because FUSE can read `/proc/<pid>/environ` (same user). In production, `CLAUDE_PROJECT_DIR` will be the primary signal — it's set by Claude Code automatically.
+
 ### What's next
 
-1. **Agent identification** — Correlate file operations to specific agents (process tree, tmux session, or file-based agent ID protocol)
+1. ~~**Agent identification**~~ — DONE. Three resolution strategies, tested.
 2. **Container integration** — Add FUSE flags to Docker config, test with actual agent sessions
 3. ~~**Concurrent write test**~~ — DONE. FUSE serialization works. Shadow captures data loss correctly.
 4. **Policy enforcement** — Detect violations (e.g., notebook was overwritten with Write tool) and flag them without blocking

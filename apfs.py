@@ -24,7 +24,136 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 
-from fuse import FUSE, FuseOSError, Operations
+from fuse import FUSE, FuseOSError, Operations, fuse_get_context
+
+
+class AgentIdentifier:
+    """Identifies which agent made a file operation using process introspection.
+
+    Strategy: FUSE provides the PID of the calling process. We walk
+    /proc/<pid>/.. up the process tree looking for a tmux server,
+    then map the tmux session name to an agent name.
+    """
+
+    def __init__(self, session_map=None):
+        # Map tmux session names to agent names
+        # Default matches our three-perspective setup
+        self.session_map = session_map or {
+            "sixel-comms-email": "comms",
+            "sixel-bio-email": "bio",
+            "sixel-rev-email": "reviewer",
+        }
+        self._cache = {}  # pid -> agent_id (short-lived cache)
+
+    def identify(self):
+        """Identify the agent making the current FUSE call.
+
+        Resolution order:
+        1. APFS_AGENT_ID env var on calling process (explicit, highest priority)
+        2. CLAUDE_PROJECT_DIR env var (Claude Code sessions)
+        3. tmux session name mapping (our three-perspective setup)
+        4. "unknown" fallback
+        """
+        try:
+            ctx = fuse_get_context()
+            pid = ctx[2]  # (uid, gid, pid)
+        except Exception:
+            return "unknown"
+
+        # Check cache
+        if pid in self._cache:
+            return self._cache[pid]
+
+        agent = self._resolve_agent(pid)
+        self._cache[pid] = agent
+        return agent
+
+    def _resolve_agent(self, pid):
+        """Identify agent from process environment and ancestry."""
+        # First: check the calling process's own environment
+        env_agent = self._check_env(pid)
+        if env_agent != "unknown":
+            return env_agent
+
+        # Second: walk up the process tree checking each ancestor's env
+        visited = set()
+        current = pid
+
+        while current and current > 1 and current not in visited:
+            visited.add(current)
+            try:
+                stat_path = f"/proc/{current}/stat"
+                with open(stat_path, 'r') as f:
+                    stat = f.read()
+                close_paren = stat.rfind(')')
+                fields = stat[close_paren + 2:].split()
+                ppid = int(fields[1])
+
+                env_agent = self._check_env(ppid)
+                if env_agent != "unknown":
+                    return env_agent
+
+                current = ppid
+            except (FileNotFoundError, PermissionError, ValueError, IndexError):
+                break
+
+        return "unknown"
+
+    def _check_env(self, pid):
+        """Check a process's environment for agent identification."""
+        try:
+            env_path = f"/proc/{pid}/environ"
+            with open(env_path, 'rb') as f:
+                env_data = f.read()
+
+            env_vars = {}
+            for item in env_data.split(b'\x00'):
+                try:
+                    decoded = item.decode('utf-8', errors='replace')
+                    if '=' in decoded:
+                        key, val = decoded.split('=', 1)
+                        env_vars[key] = val
+                except ValueError:
+                    continue
+
+            # Explicit agent ID (highest priority)
+            if 'APFS_AGENT_ID' in env_vars:
+                return env_vars['APFS_AGENT_ID']
+
+            # Claude Code project directory
+            if 'CLAUDE_PROJECT_DIR' in env_vars:
+                project = env_vars['CLAUDE_PROJECT_DIR']
+                if 'sixel-comms' in project:
+                    return 'comms'
+                elif 'sixel-bio' in project:
+                    return 'bio'
+                elif 'sixel-reviewer' in project:
+                    return 'reviewer'
+
+            # tmux session name
+            if 'TMUX' in env_vars:
+                try:
+                    import subprocess
+                    pane = env_vars.get('TMUX_PANE', '')
+                    result = subprocess.run(
+                        ['tmux', 'display-message', '-p', '-t', pane, '#{session_name}'],
+                        capture_output=True, text=True, timeout=2
+                    )
+                    if result.returncode == 0:
+                        session_name = result.stdout.strip()
+                        if session_name in self.session_map:
+                            return self.session_map[session_name]
+                        return session_name
+                except Exception:
+                    pass
+
+            return "unknown"
+        except (FileNotFoundError, PermissionError):
+            return "unknown"
+
+    def clear_cache(self):
+        """Clear the PID cache (call periodically or on process exits)."""
+        self._cache.clear()
 
 
 class ShadowEngine:
@@ -165,11 +294,13 @@ class ShadowEngine:
 class APFS(Operations):
     """FUSE passthrough filesystem with shadow support."""
 
-    def __init__(self, root, shadow_engine):
+    def __init__(self, root, shadow_engine, agent_identifier=None):
         self.root = os.path.realpath(root)
         self.shadow = shadow_engine
+        self.agent_id = agent_identifier or AgentIdentifier()
         self._file_buffers = {}  # fh -> accumulated writes
         self._file_paths = {}   # fh -> relative path
+        self._file_agents = {}  # fh -> agent_id at open time
         self._next_fh = 100
         self._fh_lock = Lock()
 
@@ -240,10 +371,11 @@ class APFS(Operations):
         if self.shadow.is_watched(rel):
             # Read content before deletion for shadow
             full = self._full_path(path)
+            agent = self.agent_id.identify()
             try:
                 with open(full, 'r') as f:
                     content = f.read()
-                self.shadow.process_write(rel, "", agent_id="unknown-delete")
+                self.shadow.process_write(rel, "", agent_id=f"{agent}-delete")
             except:
                 pass
         return os.unlink(self._full_path(path))
@@ -272,6 +404,7 @@ class APFS(Operations):
             self._next_fh += 1
 
         self._file_paths[fh] = rel
+        self._file_agents[fh] = self.agent_id.identify()
 
         # Snapshot the file if it's watched and we don't have one yet
         if self.shadow.is_watched(rel) and self.shadow.get_snapshot(rel) is None:
@@ -296,6 +429,7 @@ class APFS(Operations):
         rel = self._rel_path(path)
         self._file_paths[fh] = rel
         self._file_buffers[fh] = fd
+        self._file_agents[fh] = self.agent_id.identify()
 
         if self.shadow.is_watched(rel):
             self.shadow.snapshot(rel, "")
@@ -331,6 +465,7 @@ class APFS(Operations):
         """Called when file is closed. This is where we diff for shadows."""
         fd = self._file_buffers.pop(fh, None)
         rel = self._file_paths.pop(fh, None)
+        agent = self._file_agents.pop(fh, "unknown")
 
         if fd is not None:
             os.close(fd)
@@ -341,9 +476,9 @@ class APFS(Operations):
             try:
                 with open(full, 'r') as f:
                     new_content = f.read()
-                result = self.shadow.process_write(rel, new_content, agent_id="agent")
+                result = self.shadow.process_write(rel, new_content, agent_id=agent)
                 if result["type"] != "no_change":
-                    print(f"[APFS] {result['type']} on {rel}: "
+                    print(f"[APFS] {result['type']} on {rel} by {agent}: "
                           f"+{result.get('additions', 0)}/-{result.get('deletions', 0)}")
             except Exception as e:
                 print(f"[APFS] shadow error on {rel}: {e}")
@@ -363,6 +498,9 @@ def main():
                         help='Where to store shadow files (default: /tmp/apfs-shadows)')
     parser.add_argument('--watch', nargs='+', default=[],
                         help='Files to watch (relative to backing_dir)')
+    parser.add_argument('--session-map', nargs='+', default=[],
+                        metavar='SESSION=AGENT',
+                        help='Map tmux session names to agent IDs (e.g., sixel-comms-email=comms)')
     parser.add_argument('--foreground', '-f', action='store_true', default=True,
                         help='Run in foreground (default)')
     args = parser.parse_args()
@@ -377,6 +515,14 @@ def main():
     if not os.path.isdir(mount):
         print(f"Error: mount_point '{mount}' does not exist")
         sys.exit(1)
+
+    # Initialize agent identifier
+    session_map = {}
+    for mapping in args.session_map:
+        if '=' in mapping:
+            session, agent = mapping.split('=', 1)
+            session_map[session] = agent
+    agent_identifier = AgentIdentifier(session_map if session_map else None)
 
     # Initialize shadow engine
     shadow = ShadowEngine(args.shadow_dir, args.watch)
@@ -396,8 +542,8 @@ def main():
     print(f"[APFS] Shadows: {args.shadow_dir}")
     print(f"[APFS] Starting FUSE filesystem...")
 
-    FUSE(APFS(backing, shadow), mount, nothreads=False, foreground=args.foreground,
-         allow_other=False)
+    FUSE(APFS(backing, shadow, agent_identifier), mount, nothreads=False,
+         foreground=args.foreground, allow_other=False)
 
 
 if __name__ == '__main__':
