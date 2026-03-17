@@ -4,7 +4,7 @@
 
 **Repo:** sixel-et/apfs (public)
 **Location:** ~/apfs/
-**Status:** Concept and architecture. No code yet.
+**Status:** Python prototype written and tested. All four operations (append, modify, delete, unlink) verified in QEMU/KVM VM.
 
 ### What This Is
 
@@ -26,10 +26,23 @@ Host kernel (6.17) has FUSE support including passthrough mode (merged 6.9).
 
 ### Implementation Plan
 
-1. **Python prototype** (fusepy, ~150 lines passthrough + shadow logic)
-2. **Test on single file** with one agent
+1. ~~**Python prototype**~~ (fusepy, ~400 lines passthrough + shadow logic) — DONE 2026-03-17
+2. ~~**Test on single file**~~ with one agent — DONE 2026-03-17 (QEMU/KVM VM, all 4 operations verified)
 3. **Multi-agent test** with three perspectives on shared notebook
 4. **Production version** in Go (single binary, good concurrency)
+
+### VM for Testing
+
+QEMU/KVM VM lives at `~/apfs/vm/`. Boot command:
+```
+qemu-system-x86_64 -enable-kvm -m 1024 -smp 2 \
+  -drive file=~/apfs/vm/disk.qcow2,format=qcow2 \
+  -drive file=~/apfs/vm/seed.iso,format=raw \
+  -net nic -net user,hostfwd=tcp::2222-:22 \
+  -display none -serial null -daemonize
+```
+SSH: `sshpass -p apfs ssh -p 2222 ubuntu@localhost`
+Prototype at: `/home/ubuntu/apfs.py` (copied from `~/apfs/apfs.py`)
 
 ### Hackathon Playbook
 

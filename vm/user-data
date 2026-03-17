@@ -1,0 +1,14 @@
+#cloud-config
+password: apfs
+chpasswd:
+  expire: false
+ssh_pwauth: true
+packages:
+  - fuse3
+  - libfuse3-dev
+  - python3-pip
+  - python3-venv
+  - git
+runcmd:
+  - echo "user_allow_other" >> /etc/fuse.conf
+  - su - ubuntu -c "pip3 install fusepy --break-system-packages"

@@ -50,8 +50,52 @@ Key architectural decision: **FUSE, not a daemon.** A file-watching daemon (inot
 
 ### Next steps
 
-1. Python prototype — passthrough FUSE with shadow logic for a single watched file
+1. ~~Python prototype — passthrough FUSE with shadow logic for a single watched file~~ [done 2026-03-17]
 2. Container config — add FUSE Docker flags
 3. Test with one perspective writing to a notebook
 4. Test with three perspectives writing concurrently
 5. Analyze shadow output as training signal
+
+## 2026-03-17: Prototype Testing — All Four Operations Verified
+
+### Setup
+
+Local QEMU/KVM VM (Ubuntu 24.04 minimal, 1GB RAM, 2 CPUs). FUSE3 + fusepy installed via cloud-init. Prototype (`apfs.py`, ~400 lines Python) deployed.
+
+Test environment:
+- Backing dir: `/tmp/apfs-backing/` (real files on disk)
+- Mount point: `/tmp/apfs-mount/` (FUSE passthrough)
+- Shadow dir: `/tmp/apfs-shadows/` (shadow + journal output)
+- Watched file: `notebook.md`
+
+Initial content: two notebook entries (Entry 1: "sky is blue", Entry 2: "water is wet").
+
+### Test Results
+
+**Test 1 — Append** (`cat >> notebook.md`): Added Entry 3 ("fire is hot"). Shadow initialized with original content, then appended new entry with `<!-- APFS: append by agent -->` marker. Journal: `+4/-0 lines`. Correct.
+
+**Test 2 — Modification** (`cat > notebook.md` with Entry 2 changed): Changed "Second observation" → "REVISED observation", "Water is wet" → "Water is wet AND cold". Shadow shows old content struck through (`~~## Entry 2 — Second observation~~`) with `[modified ... by agent]` attribution, `<!-- replaced with: -->` separator, then new content. Journal: `+2/-2 lines`. Correct.
+
+**Test 3 — Deletion** (`cat > notebook.md` without Entry 2): Removed Entry 2 entirely. Shadow shows all of Entry 2's content struck through with `[deleted ... by agent]`. Journal: `+0/-4 lines`. Correct.
+
+**Test 4 — File unlink** (`rm notebook.md`): Deleted the entire file. Shadow preserves all remaining content struck through with `[deleted ... by unknown-delete]` attribution. "unknown-delete" because unlink goes through a different code path than open/write/close. Journal: `+0/-9 lines`. Shadow file survives — the shadow is the record, it persists after the actual file is gone.
+
+### Observations
+
+1. **The shadow tells the complete story.** Reading the shadow from top to bottom, you see: original content → what was added → what was changed (both versions) → what was deleted → what was obliterated. The divergence grows with each destructive operation. This IS the training signal.
+
+2. **Change classification works.** unified_diff with n=0 (no context lines) correctly separates pure appends, pure deletions, and modifications. The classification drives the shadow format — appends pass through clean, deletions get strikethrough, modifications show both.
+
+3. **Passthrough is transparent.** The file through the mount point behaves identically to the backing file. Read/write/append/delete all work normally. The agent operating through the mount would not know APFS exists.
+
+4. **Agent attribution is placeholder.** Current prototype uses "agent" for all write operations and "unknown-delete" for unlinks. In production, we'd need process correlation (PID → tmux session → perspective name) to attribute operations to specific agents.
+
+5. **Shadow append-only property.** The shadow file is only ever appended to, never truncated. Even if the actual file is destroyed, the shadow preserves the complete behavioral record. This is the key invariant.
+
+### What's next
+
+1. **Agent identification** — Correlate file operations to specific agents (process tree, tmux session, or file-based agent ID protocol)
+2. **Container integration** — Add FUSE flags to Docker config, test with actual agent sessions
+3. **Concurrent write test** — Two processes writing to the same file through the mount
+4. **Policy enforcement** — Detect violations (e.g., notebook was overwritten with Write tool) and flag them without blocking
+5. **Performance measurement** — Baseline passthrough overhead, shadow diff cost per write
