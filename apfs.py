@@ -69,87 +69,91 @@ class AgentIdentifier:
         return agent
 
     def _resolve_agent(self, pid):
-        """Identify agent from process environment and ancestry."""
-        # First: check the calling process's own environment
-        env_agent = self._check_env(pid)
-        if env_agent != "unknown":
-            return env_agent
+        """Identify agent from process environment and ancestry.
 
-        # Second: walk up the process tree checking each ancestor's env
+        Resolution order per process:
+        1. APFS_AGENT_ID env var (explicit override)
+        2. Is this a 'claude' process? → use its cwd as identity
+        3. Check parent, repeat
+
+        The key insight: each Claude Code instance starts from a
+        directory (e.g., ~/sixel-comms/). That cwd IS the identity.
+        Every tool call spawns child processes that inherit from Claude,
+        so we walk up until we find the claude process and read its cwd.
+        """
         visited = set()
         current = pid
 
         while current and current > 1 and current not in visited:
             visited.add(current)
             try:
+                # Check for explicit APFS_AGENT_ID first
+                agent = self._check_explicit_id(current)
+                if agent:
+                    return agent
+
+                # Check if this is a claude process — if so, use its cwd
+                agent = self._check_claude_cwd(current)
+                if agent:
+                    return agent
+
+                # Walk to parent
                 stat_path = f"/proc/{current}/stat"
                 with open(stat_path, 'r') as f:
                     stat = f.read()
                 close_paren = stat.rfind(')')
                 fields = stat[close_paren + 2:].split()
-                ppid = int(fields[1])
+                current = int(fields[1])  # ppid
 
-                env_agent = self._check_env(ppid)
-                if env_agent != "unknown":
-                    return env_agent
-
-                current = ppid
             except (FileNotFoundError, PermissionError, ValueError, IndexError):
                 break
 
         return "unknown"
 
-    def _check_env(self, pid):
-        """Check a process's environment for agent identification."""
+    def _check_explicit_id(self, pid):
+        """Check for APFS_AGENT_ID env var on a process."""
         try:
-            env_path = f"/proc/{pid}/environ"
-            with open(env_path, 'rb') as f:
+            with open(f"/proc/{pid}/environ", 'rb') as f:
                 env_data = f.read()
-
-            env_vars = {}
             for item in env_data.split(b'\x00'):
                 try:
                     decoded = item.decode('utf-8', errors='replace')
-                    if '=' in decoded:
-                        key, val = decoded.split('=', 1)
-                        env_vars[key] = val
+                    if decoded.startswith('APFS_AGENT_ID='):
+                        return decoded.split('=', 1)[1]
                 except ValueError:
                     continue
-
-            # Explicit agent ID (highest priority)
-            if 'APFS_AGENT_ID' in env_vars:
-                return env_vars['APFS_AGENT_ID']
-
-            # Claude Code project directory
-            if 'CLAUDE_PROJECT_DIR' in env_vars:
-                project = env_vars['CLAUDE_PROJECT_DIR']
-                if 'sixel-comms' in project:
-                    return 'comms'
-                elif 'sixel-bio' in project:
-                    return 'bio'
-                elif 'sixel-reviewer' in project:
-                    return 'reviewer'
-
-            # tmux session name
-            if 'TMUX' in env_vars:
-                try:
-                    import subprocess
-                    pane = env_vars.get('TMUX_PANE', '')
-                    result = subprocess.run(
-                        ['tmux', 'display-message', '-p', '-t', pane, '#{session_name}'],
-                        capture_output=True, text=True, timeout=2
-                    )
-                    if result.returncode == 0:
-                        session_name = result.stdout.strip()
-                        if session_name in self.session_map:
-                            return self.session_map[session_name]
-                        return session_name
-                except Exception:
-                    pass
-
-            return "unknown"
         except (FileNotFoundError, PermissionError):
-            return "unknown"
+            pass
+        return None
+
+    def _check_claude_cwd(self, pid):
+        """If this pid is a claude process, return its cwd-derived agent name."""
+        try:
+            # Read the process command
+            with open(f"/proc/{pid}/cmdline", 'rb') as f:
+                cmdline = f.read().decode('utf-8', errors='replace')
+
+            # Is this a claude process?
+            if 'claude' not in cmdline.lower():
+                return None
+
+            # Read its current working directory
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+
+            # Use the directory name as the agent identity
+            # e.g., /home/sixel/sixel-comms → sixel-comms
+            dirname = os.path.basename(cwd)
+
+            # If we have a session map entry, use the mapped name
+            for session_key, agent_name in self.session_map.items():
+                if session_key in dirname or session_key in cwd:
+                    return agent_name
+
+            # Otherwise use the directory basename directly
+            return dirname
+
+        except (FileNotFoundError, PermissionError, OSError):
+            return None
 
     def clear_cache(self):
         """Clear the PID cache (call periodically or on process exits)."""
