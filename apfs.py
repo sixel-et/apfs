@@ -156,6 +156,42 @@ class AgentIdentifier:
         self._cache.clear()
 
 
+class FilePolicy:
+    """Defines what operations are allowed on a watched file.
+
+    Policies:
+    - "append_only": only appends allowed. Deletions and modifications are violations.
+      (notebooks — the behavioral record should only grow)
+    - "annotate_only": appends and modifications allowed. Deletions are violations.
+      (notes to self — can be reorganized but content shouldn't be lost)
+    - "unrestricted": all operations allowed. Just journal them.
+      (config files, scratch files)
+    """
+    APPEND_ONLY = "append_only"
+    ANNOTATE_ONLY = "annotate_only"
+    UNRESTRICTED = "unrestricted"
+
+    @staticmethod
+    def check(policy, change_type):
+        """Check if a change type violates the policy.
+
+        Returns (is_violation: bool, reason: str or None).
+        """
+        if policy == FilePolicy.APPEND_ONLY:
+            if change_type == "deletion":
+                return True, "content deleted from append-only file"
+            if change_type == "modification":
+                return True, "content modified in append-only file (should be append + strikethrough)"
+            return False, None
+
+        if policy == FilePolicy.ANNOTATE_ONLY:
+            if change_type == "deletion":
+                return True, "content deleted from annotate-only file (should use strikethrough)"
+            return False, None
+
+        return False, None
+
+
 class ShadowEngine:
     """Maintains shadow copies of watched files.
 
@@ -165,10 +201,11 @@ class ShadowEngine:
     - Modifications: old content struck, new content shown after
     """
 
-    def __init__(self, shadow_dir, watch_files):
+    def __init__(self, shadow_dir, watch_files, file_policies=None):
         self.shadow_dir = Path(shadow_dir)
         self.shadow_dir.mkdir(parents=True, exist_ok=True)
         self.watch_files = set(watch_files)  # relative paths to watch
+        self.file_policies = file_policies or {}  # path -> FilePolicy constant
         self.snapshots = {}  # path -> last known content (lines)
         self.lock = Lock()
 
@@ -274,19 +311,38 @@ class ShadowEngine:
             # Update snapshot
             self.snapshots[rel_path] = new_lines
 
+            # Check policy
+            policy = self.file_policies.get(rel_path, FilePolicy.UNRESTRICTED)
+            is_violation, violation_reason = FilePolicy.check(policy, change_type)
+
             result = {
                 "type": change_type,
                 "timestamp": timestamp,
                 "agent": agent_id,
                 "deletions": len(deletions),
                 "additions": len(additions),
+                "violation": is_violation,
+                "violation_reason": violation_reason,
+                "policy": policy,
             }
 
             # Log to journal
             journal_file = self.shadow_dir / "journal.log"
             with open(journal_file, 'a') as f:
-                f.write(f"[{timestamp}] {change_type} on {rel_path} by {agent_id}: "
-                        f"+{len(additions)}/-{len(deletions)} lines\n")
+                prefix = "VIOLATION " if is_violation else ""
+                f.write(f"[{timestamp}] {prefix}{change_type} on {rel_path} by {agent_id}: "
+                        f"+{len(additions)}/-{len(deletions)} lines")
+                if is_violation:
+                    f.write(f" [{violation_reason}]")
+                f.write("\n")
+
+            # Log violations separately for easy scanning
+            if is_violation:
+                violations_file = self.shadow_dir / "violations.log"
+                with open(violations_file, 'a') as f:
+                    f.write(f"[{timestamp}] {rel_path} ({policy}): "
+                            f"{violation_reason} by {agent_id} "
+                            f"(+{len(additions)}/-{len(deletions)} lines)\n")
 
             return result
 
@@ -478,8 +534,11 @@ class APFS(Operations):
                     new_content = f.read()
                 result = self.shadow.process_write(rel, new_content, agent_id=agent)
                 if result["type"] != "no_change":
-                    print(f"[APFS] {result['type']} on {rel} by {agent}: "
+                    prefix = "VIOLATION " if result.get("violation") else ""
+                    print(f"[APFS] {prefix}{result['type']} on {rel} by {agent}: "
                           f"+{result.get('additions', 0)}/-{result.get('deletions', 0)}")
+                    if result.get("violation"):
+                        print(f"[APFS] *** {result['violation_reason']} ***")
             except Exception as e:
                 print(f"[APFS] shadow error on {rel}: {e}")
 
@@ -498,6 +557,10 @@ def main():
                         help='Where to store shadow files (default: /tmp/apfs-shadows)')
     parser.add_argument('--watch', nargs='+', default=[],
                         help='Files to watch (relative to backing_dir)')
+    parser.add_argument('--policy', nargs='+', default=[],
+                        metavar='FILE=POLICY',
+                        help='Set policy per file: append_only, annotate_only, unrestricted '
+                             '(e.g., notebook.md=append_only)')
     parser.add_argument('--session-map', nargs='+', default=[],
                         metavar='SESSION=AGENT',
                         help='Map tmux session names to agent IDs (e.g., sixel-comms-email=comms)')
@@ -524,18 +587,30 @@ def main():
             session_map[session] = agent
     agent_identifier = AgentIdentifier(session_map if session_map else None)
 
+    # Parse file policies
+    file_policies = {}
+    valid_policies = {FilePolicy.APPEND_ONLY, FilePolicy.ANNOTATE_ONLY, FilePolicy.UNRESTRICTED}
+    for mapping in args.policy:
+        if '=' in mapping:
+            filename, policy = mapping.split('=', 1)
+            if policy in valid_policies:
+                file_policies[filename] = policy
+            else:
+                print(f"Warning: unknown policy '{policy}' for {filename}, using unrestricted")
+
     # Initialize shadow engine
-    shadow = ShadowEngine(args.shadow_dir, args.watch)
+    shadow = ShadowEngine(args.shadow_dir, args.watch, file_policies)
 
     # Snapshot any existing watched files
     for watch_file in args.watch:
         full = os.path.join(backing, watch_file)
+        policy = file_policies.get(watch_file, "unrestricted")
         if os.path.exists(full):
             with open(full, 'r') as f:
                 shadow.snapshot(watch_file, f.read())
-            print(f"[APFS] Watching: {watch_file} (snapshotted)")
+            print(f"[APFS] Watching: {watch_file} [{policy}] (snapshotted)")
         else:
-            print(f"[APFS] Watching: {watch_file} (will snapshot on create)")
+            print(f"[APFS] Watching: {watch_file} [{policy}] (will snapshot on create)")
 
     print(f"[APFS] Backing: {backing}")
     print(f"[APFS] Mount:   {mount}")

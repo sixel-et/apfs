@@ -128,10 +128,26 @@ Shadow shows comms' content struck through with `[modified ... by bio]` attribut
 
 **Note on resolution:** In our container, all three perspectives run as user `sixel` but in different tmux sessions with different `CLAUDE_PROJECT_DIR` values. The env var approach works because FUSE can read `/proc/<pid>/environ` (same user). In production, `CLAUDE_PROJECT_DIR` will be the primary signal — it's set by Claude Code automatically.
 
+### Test 7 — Policy enforcement
+
+Added `FilePolicy` class with three policies:
+- `append_only`: only appends allowed — deletions and modifications are violations (for notebooks)
+- `annotate_only`: appends and modifications allowed — deletions are violations (for notes to self)
+- `unrestricted`: everything allowed — just journal it (for config files)
+
+Test: notebook.md set to `append_only`.
+1. comms appends Entry 2 → logged normally, no violation
+2. bio overwrites the file → `VIOLATION modification on notebook.md by bio` in journal + separate `violations.log`
+
+**Critical design point:** the overwrite was NOT blocked. Bio's write went through. APFS observed and reported. The shadow preserves the evidence, the violations log flags it for review. This matches Eric's directive: "don't change how the agent writes. Change what the filesystem does when the agent writes."
+
+CLI: `--policy notebook.md=append_only "notes-to-self.md=annotate_only"`
+
 ### What's next
 
 1. ~~**Agent identification**~~ — DONE. Three resolution strategies, tested.
 2. **Container integration** — Add FUSE flags to Docker config, test with actual agent sessions
 3. ~~**Concurrent write test**~~ — DONE. FUSE serialization works. Shadow captures data loss correctly.
-4. **Policy enforcement** — Detect violations (e.g., notebook was overwritten with Write tool) and flag them without blocking
+4. ~~**Policy enforcement**~~ — DONE. Violations detected and logged without blocking.
 5. **Performance measurement** — Baseline passthrough overhead, shadow diff cost per write
+6. **Violation notification** — When a violation occurs, notify the agent (tmux injection?) or Eric (email?)
